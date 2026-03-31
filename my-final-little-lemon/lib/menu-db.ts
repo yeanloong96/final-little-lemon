@@ -79,6 +79,11 @@ export async function getMenuItemsFiltered(categories: string[], searchText: str
   return await db.getAllAsync<DbMenuItem>(sql, params);
 }
 
+export async function clearMenuTable() {
+  const db = await getDb();
+  await db.execAsync(`DELETE FROM ${TABLE};`);
+}
+
 export async function saveMenuItems(items: UpsertMenuItem[]) {
   const db = await getDb();
   await db.withTransactionAsync(async () => {

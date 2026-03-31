@@ -12,7 +12,15 @@ import {
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import LittleLemonLogo from '@/assets/images/LittleLemonLogo.svg';
 import HomeContentLogo from '@/assets/images/HomeContentLogo.svg';
-import { getMenuCount, getMenuItemsFiltered, initMenuDb, saveMenuItems } from '@/lib/menu-db';
+import {
+  clearMenuTable,
+  getMenuCount,
+  getMenuItemsFiltered,
+  initMenuDb,
+  saveMenuItems,
+} from '@/lib/menu-db';
+import { Redirect, router } from 'expo-router';
+import { getUserProfile, initUserDb, clearUserTable } from '@/lib/user-db';
 
 type ApiMenuItem = {
   name: string;
@@ -61,8 +69,8 @@ function normalizeCategory(apiCategory: string) {
 }
 
 export default function HomeScreen() {
-  // Replace this with your real auth state when you wire sign-in.
-  const isSignedIn = true;
+  const [isSignedIn, setIsSignedIn] = useState<boolean | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
 
   const [activeCategories, setActiveCategories] = useState<(typeof CATEGORIES)[number][]>(
     () => [...CATEGORIES]
@@ -71,6 +79,18 @@ export default function HomeScreen() {
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [menu, setMenu] = useState<MenuItem[]>([]);
   const [menuStatus, setMenuStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await initUserDb();
+      const profile = await getUserProfile();
+      if (!cancelled) setIsSignedIn(!!profile);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -152,15 +172,38 @@ export default function HomeScreen() {
     });
   }, [menu, query]);
 
+  if (isSignedIn === null) return null;
+  if (!isSignedIn) return <Redirect href={'/onboarding' as any} />;
+
+  async function logout() {
+    if (isLoggingOut) return;
+    try {
+      setIsLoggingOut(true);
+      await initMenuDb();
+      await initUserDb();
+      await clearMenuTable();
+      await clearUserTable();
+      setIsSignedIn(false);
+      router.replace('/onboarding');
+    } finally {
+      setIsLoggingOut(false);
+    }
+  }
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.screen}>
         <View style={styles.topBar}>
           <View style={styles.topBarSpacer} />
           <LittleLemonLogo width={150} height={34} />
-          <View style={styles.avatar}>
+          <Pressable
+            style={styles.avatar}
+            onPress={logout}
+            disabled={isLoggingOut}
+            accessibilityRole="button"
+            accessibilityLabel="Profile (logout)">
             <IconSymbol name="person.crop.circle.fill" size={36} color={COLORS.green} />
-          </View>
+          </Pressable>
         </View>
 
         <View style={styles.hero}>
