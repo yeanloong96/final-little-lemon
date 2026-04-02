@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
 import { Image } from 'expo-image';
 import {
   FlatList,
   Pressable,
+  RefreshControl,
   SafeAreaView,
   StyleSheet,
   Text,
@@ -13,14 +15,13 @@ import { IconSymbol } from '@/components/ui/icon-symbol';
 import LittleLemonLogo from '@/assets/images/LittleLemonLogo.svg';
 import HomeContentLogo from '@/assets/images/HomeContentLogo.svg';
 import {
-  clearMenuTable,
   getMenuCount,
   getMenuItemsFiltered,
   initMenuDb,
   saveMenuItems,
 } from '@/lib/menu-db';
 import { Redirect, router } from 'expo-router';
-import { getUserProfile, initUserDb, clearUserTable } from '@/lib/user-db';
+import { getUserProfile, initUserDb, type UserProfile } from '@/lib/user-db';
 
 type ApiMenuItem = {
   name: string;
@@ -68,9 +69,19 @@ function normalizeCategory(apiCategory: string) {
   return 'Starters';
 }
 
+function mapApiMenuToItems(json: { menu: ApiMenuItem[] }): MenuItem[] {
+  return (json.menu ?? []).map((i) => ({
+    id: `${i.name}-${i.category}`.toLowerCase().replace(/\s+/g, '-'),
+    title: i.name,
+    description: i.description,
+    price: `$${Number(i.price).toFixed(2)}`,
+    imageFileName: i.image,
+    category: normalizeCategory(i.category),
+  }));
+}
+
 export default function HomeScreen() {
-  const [isSignedIn, setIsSignedIn] = useState<boolean | null>(null);
-  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [profile, setProfile] = useState<UserProfile | null | undefined>(undefined);
 
   const [activeCategories, setActiveCategories] = useState<(typeof CATEGORIES)[number][]>(
     () => [...CATEGORIES]
@@ -79,61 +90,85 @@ export default function HomeScreen() {
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [menu, setMenu] = useState<MenuItem[]>([]);
   const [menuStatus, setMenuStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  const [refreshing, setRefreshing] = useState(false);
+
+  const activeCategoriesRef = useRef(activeCategories);
+  const debouncedQueryRef = useRef(debouncedQuery);
+  useEffect(() => {
+    activeCategoriesRef.current = activeCategories;
+  }, [activeCategories]);
+  useEffect(() => {
+    debouncedQueryRef.current = debouncedQuery;
+  }, [debouncedQuery]);
+
+  /** Avoid re-running menu load when `profile` is a new object reference (e.g. refetch on focus). */
+  const isProfileReady = profile !== undefined && profile !== null;
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      (async () => {
+        await initUserDb();
+        const row = await getUserProfile();
+        if (!cancelled) setProfile(row);
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [])
+  );
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      await initUserDb();
-      const profile = await getUserProfile();
-      if (!cancelled) setIsSignedIn(!!profile);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!isProfileReady) {
+      setMenuStatus('idle');
+      setMenu([]);
+      return;
+    }
 
-  useEffect(() => {
     let cancelled = false;
     async function loadMenu() {
       try {
-        if (!isSignedIn) return;
         setMenuStatus('loading');
         await initMenuDb();
 
         const existingCount = await getMenuCount();
         if (existingCount > 0) {
-          if (!cancelled) setMenuStatus('loaded');
+          const rows = await getMenuItemsFiltered(
+            activeCategoriesRef.current,
+            debouncedQueryRef.current
+          );
+          if (!cancelled) {
+            setMenuStatus('loaded');
+            setMenu(rows);
+          }
           return;
         }
 
         const res = await fetch(MENU_API_URL);
         if (!res.ok) throw new Error(`Menu fetch failed: ${res.status}`);
         const json = (await res.json()) as { menu: ApiMenuItem[] };
-
-        const next: MenuItem[] = (json.menu ?? []).map((i) => ({
-          id: `${i.name}-${i.category}`.toLowerCase().replace(/\s+/g, '-'),
-          title: i.name,
-          description: i.description,
-          price: `$${Number(i.price).toFixed(2)}`,
-          imageFileName: i.image,
-          category: normalizeCategory(i.category),
-        }));
-
+        const next = mapApiMenuToItems(json);
         await saveMenuItems(next);
 
+        const rows = await getMenuItemsFiltered(
+          activeCategoriesRef.current,
+          debouncedQueryRef.current
+        );
         if (!cancelled) {
           setMenuStatus('loaded');
+          setMenu(rows);
         }
-      } catch {
+      } catch(error) {
+        console.log('Error loading menu', error);
         if (!cancelled) setMenuStatus('error');
       }
-    };
+    }
 
     loadMenu();
     return () => {
       cancelled = true;
     };
-  }, [isSignedIn]);
+  }, [isProfileReady]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQuery(query), 500);
@@ -144,7 +179,7 @@ export default function HomeScreen() {
     let cancelled = false;
     async function runFilteredQuery() {
       try {
-        if (!isSignedIn) return;
+        if (!isProfileReady) return;
         if (menuStatus !== 'loaded') return;
         await initMenuDb();
         const rows = await getMenuItemsFiltered(activeCategories, debouncedQuery);
@@ -158,7 +193,7 @@ export default function HomeScreen() {
     return () => {
       cancelled = true;
     };
-  }, [activeCategories, debouncedQuery, isSignedIn, menuStatus]);
+  }, [activeCategories, debouncedQuery, isProfileReady, menuStatus]);
 
   const filteredMenu = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -172,23 +207,30 @@ export default function HomeScreen() {
     });
   }, [menu, query]);
 
-  if (isSignedIn === null) return null;
-  if (!isSignedIn) return <Redirect href={'/onboarding' as any} />;
+  const menuFiltersDisabled = menuStatus === 'loading' || menuStatus === 'error';
 
-  async function logout() {
-    if (isLoggingOut) return;
+  const onRefreshMenu = useCallback(async () => {
+    if (!isProfileReady) return;
+    setRefreshing(true);
     try {
-      setIsLoggingOut(true);
       await initMenuDb();
-      await initUserDb();
-      await clearMenuTable();
-      await clearUserTable();
-      setIsSignedIn(false);
-      router.replace('/onboarding');
+      const res = await fetch(MENU_API_URL);
+      if (!res.ok) throw new Error(`Menu fetch failed: ${res.status}`);
+      const json = (await res.json()) as { menu: ApiMenuItem[] };
+      const next = mapApiMenuToItems(json);
+      await saveMenuItems(next);
+      setMenuStatus('loaded');
+      const rows = await getMenuItemsFiltered(activeCategories, debouncedQuery);
+      setMenu(rows);
+    } catch {
+      setMenuStatus('error');
     } finally {
-      setIsLoggingOut(false);
+      setRefreshing(false);
     }
-  }
+  }, [isProfileReady, activeCategories, debouncedQuery]);
+
+  if (profile === undefined) return null;
+  if (!profile) return <Redirect href={'/onboarding' as any} />;
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -198,11 +240,18 @@ export default function HomeScreen() {
           <LittleLemonLogo width={150} height={34} />
           <Pressable
             style={styles.avatar}
-            onPress={logout}
-            disabled={isLoggingOut}
+            onPress={() => router.push('/profile' as any)}
             accessibilityRole="button"
-            accessibilityLabel="Profile (logout)">
-            <IconSymbol name="person.crop.circle.fill" size={36} color={COLORS.green} />
+            accessibilityLabel="Open profile">
+            {profile.avatarUri ? (
+              <Image
+                source={{ uri: profile.avatarUri }}
+                style={styles.avatarImage}
+                contentFit="cover"
+              />
+            ) : (
+              <IconSymbol name="person.crop.circle.fill" size={36} color={COLORS.green} />
+            )}
           </Pressable>
         </View>
 
@@ -219,7 +268,7 @@ export default function HomeScreen() {
             <HomeContentLogo width={150} height={150} />
           </View>
 
-          <View style={styles.searchRow}>
+          <View style={[styles.searchRow, menuFiltersDisabled && styles.controlsDisabled]}>
             <View style={styles.searchField}>
               <IconSymbol name="magnifyingglass" size={18} color={COLORS.muted} />
               <TextInput
@@ -231,13 +280,17 @@ export default function HomeScreen() {
                 returnKeyType="search"
                 autoCapitalize="none"
                 autoCorrect={false}
+                editable={!menuFiltersDisabled}
                 accessibilityLabel="Search menu items"
+                accessibilityState={{ disabled: menuFiltersDisabled }}
               />
               {!!query.trim().length && (
                 <Pressable
                   onPress={() => setQuery('')}
+                  disabled={menuFiltersDisabled}
                   accessibilityRole="button"
                   accessibilityLabel="Clear search"
+                  accessibilityState={{ disabled: menuFiltersDisabled }}
                   hitSlop={8}
                   style={styles.clearButton}>
                   <IconSymbol name="xmark.circle.fill" size={18} color={COLORS.muted} />
@@ -249,18 +302,21 @@ export default function HomeScreen() {
 
         <Text style={styles.orderTitle}>ORDER FOR DELIVERY!</Text>
 
-        <View style={styles.categoryRow}>
+        <View style={[styles.categoryRow, menuFiltersDisabled && styles.controlsDisabled]}>
           {CATEGORIES.map((c) => {
             const active = activeCategories.includes(c);
             return (
               <Pressable
                 key={c}
+                disabled={menuFiltersDisabled}
                 onPress={() =>
                   setActiveCategories((prev) =>
                     prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]
                   )
                 }
-                style={[styles.categoryPill, active && styles.categoryPillActive]}>
+                style={[styles.categoryPill, active && styles.categoryPillActive]}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: menuFiltersDisabled, selected: active }}>
                 <Text style={[styles.categoryText, active && styles.categoryTextActive]}>{c}</Text>
               </Pressable>
             );
@@ -272,18 +328,32 @@ export default function HomeScreen() {
         {menuStatus === 'loading' && (
           <Text style={styles.menuStatusText}>Loading menu…</Text>
         )}
-        {menuStatus === 'error' && (
-          <Text style={styles.menuStatusText}>Couldn’t load menu. Please try again.</Text>
-        )}
 
-        {menuStatus === 'loaded' && (
+        {(menuStatus === 'loaded' || menuStatus === 'error') && (
           <FlatList
-            data={filteredMenu}
+            data={menuStatus === 'loaded' ? filteredMenu : []}
             keyExtractor={(i) => i.id}
             style={styles.menuList}
             contentContainerStyle={styles.menuListContent}
             showsVerticalScrollIndicator={false}
             ItemSeparatorComponent={() => <View style={styles.itemSeparator} />}
+            ListEmptyComponent={
+              <View style={styles.menuEmptyInner}>
+                <Text style={styles.menuStatusText}>
+                  {menuStatus === 'error'
+                    ? 'Couldn’t load menu. Pull down to try again.'
+                    : 'No dishes match your filters.'}
+                </Text>
+              </View>
+            }
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefreshMenu}
+                tintColor={COLORS.green}
+                colors={[COLORS.green]}
+              />
+            }
             renderItem={({ item }) => (
               <View style={styles.menuItemRow}>
                 <View style={styles.menuItemTextCol}>
@@ -329,7 +399,16 @@ const styles = StyleSheet.create({
   },
   topBarSpacer: { width: 36 },
   logo: { width: 140, height: 34 },
-  avatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.lightGray },
+  avatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: COLORS.lightGray,
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarImage: { width: 36, height: 36, borderRadius: 18 },
 
   hero: {
     backgroundColor: COLORS.green,
@@ -357,6 +436,9 @@ const styles = StyleSheet.create({
     height: 90,
     borderRadius: 12,
     backgroundColor: COLORS.lightGray,
+  },
+  controlsDisabled: {
+    opacity: 0.45,
   },
   searchRow: {
     marginTop: 14,
@@ -418,7 +500,14 @@ const styles = StyleSheet.create({
 
   itemSeparator: { height: StyleSheet.hairlineWidth, backgroundColor: '#E6E6E6' },
   menuList: { flex: 1 },
-  menuListContent: { paddingBottom: 24 },
+  menuListContent: { flexGrow: 1, paddingBottom: 24 },
+  menuEmptyInner: {
+    flex: 1,
+    paddingTop: 24,
+    paddingHorizontal: 16,
+    minHeight: 120,
+    justifyContent: 'flex-start',
+  },
   menuItemRow: {
     flexDirection: 'row',
     paddingHorizontal: 16,

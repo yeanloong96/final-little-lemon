@@ -42,6 +42,16 @@ export default function OnboardingScreen() {
 
   const canSubmit = Object.keys(errors).length === 0;
 
+  const emailFieldHint = useMemo(() => {
+    if (email.trim().length > 0 && !isValidEmail(email)) {
+      return 'Enter a valid email';
+    }
+    if (submitted && errors.email) {
+      return errors.email;
+    }
+    return null;
+  }, [email, submitted, errors.email]);
+
   async function onSubmit() {
     setSubmitted(true);
     if (!canSubmit) return;
@@ -53,6 +63,11 @@ export default function OnboardingScreen() {
       phoneCountryCode: countryCode,
       phoneCallingCode: callingCode,
       phoneNumber: phoneNumber.trim(),
+      avatarUri: null,
+      notifyOrderStatuses: true,
+      notifyPasswordChanges: true,
+      notifySpecialOffers: true,
+      notifyNewsletter: true,
     });
     router.replace('/home');
   }
@@ -121,7 +136,7 @@ export default function OnboardingScreen() {
               autoCorrect={false}
               accessibilityLabel="Email"
             />
-            {submitted && errors.email ? <Text style={styles.error}>{errors.email}</Text> : null}
+            {emailFieldHint ? <Text style={styles.error}>{emailFieldHint}</Text> : null}
 
             <Text style={styles.label}>Phone</Text>
             <View style={styles.phoneRow}>
